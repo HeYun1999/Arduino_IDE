@@ -1,252 +1,256 @@
 #include <bluefruit.h>
 #include <OneWire.h>
 
-// -------------------------- 1. 硬件引脚与核心实例定义 --------------------------
-// M601单总线配置（DQ接D0，依赖外部10kΩ上拉电阻）
-#define ONE_WIRE_BUS 0  
+// -------------------------- 1. 核心配置宏（低功耗开关/参数） --------------------------
+#define DEBUG_MODE          1       // 0=关闭串口（低功耗），1=开启调试
+#define ONE_WIRE_BUS        0       // M601 DQ引脚（根据实际接线修改）
+#define BLE_ADV_INTERVAL    8192    // 广播间隔：8192*0.625ms=5120ms
+#define BLE_TX_POWER        -8      // 发射功率：-8dBm（降低耗电）
+#define M601_SEARCH_RETRY   2       // M601搜索重试次数
+#define TEMP_UPDATE_THRESH  0.03    // 温度变化阈值（超过才更新广播）
+// 手动定义串口引脚（根据开发板修改，此处以常见的D6/D7为例）
+#define TX_PIN              6
+#define RX_PIN              7
+
+// -------------------------- 2. 全局变量 --------------------------
 OneWire oneWire(ONE_WIRE_BUS);
+BLEBeacon beacon;
+bool m601_init_flag = false;
+byte m601_rom_addr[8] = {0};
+unsigned long last_wake_ms = 0;
+float last_temp = -999.0;
 
-// BLE信标核心实例
-BLEBeacon beacon;                  // BLE信标实例
-bool m601_init_flag = false;       // M601初始化完成标记
-byte m601_rom_addr[8] = {0};       // M601唯一64位ROM地址
-
-// -------------------------- 2. BLE信标与MAC地址参数 --------------------------
-// 制造商ID（0x0059=Nordic，可根据需求修改）
+// BLE参数
 #define MANUFACTURER_ID   0x0059
+uint8_t beaconUuid[16] = {0x01,0x12,0x23,0x34,0x45,0x56,0x67,0x78,
+                          0x89,0x9a,0xab,0xbc,0xcd,0xde,0xef,0xf0};
+uint8_t custom_mac_addr[6] = {0xAA,0xBB,0xCC,0xDD,0xEE,0xFF};
 
-// 信标UUID（自定义，扫描时可识别）
-uint8_t beaconUuid[16] = {
-  0x01, 0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78,
-  0x89, 0x9a, 0xab, 0xbc, 0xcd, 0xde, 0xef, 0xf0
-};
-
-// 自定义MAC地址（6字节，小端序！实际显示为 FF:EE:DD:CC:BB:AA）
-// 规则：最高2位必须为11（如0xAA、0xBB等，符合蓝牙静态随机地址规范）
-uint8_t custom_mac_addr[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
-
-// -------------------------- 3. M601配置与温度读取函数 --------------------------
-// M601参数配置（10kΩ上拉适配，1次/秒测量，高重复性）
+// -------------------------- 3. M601温感操作 --------------------------
 void configM601(byte rom_addr[]) {
-  // 写暂存器（配置测量参数）
   oneWire.reset();                
   oneWire.select(rom_addr);       
   oneWire.write(0x4E);            // 写暂存器指令
-  oneWire.write(0x00);            // Tha_Set_lsb（默认）
-  oneWire.write(0x00);            // Tla_Set_lsb（默认）
-  oneWire.write(0x0A);            // 配置：1次/秒 + 高重复性
-  delayMicroseconds(180);         // 10kΩ上拉写操作等待
+  oneWire.write(0x00);            // Tha_Set_lsb
+  oneWire.write(0x00);            // Tla_Set_lsb
+  oneWire.write(0x0A);            // 1次/秒测量 + 高重复性
+  delayMicroseconds(100);
 
-  // 保存配置到E2PROM
   oneWire.reset();
   oneWire.select(rom_addr);
-  oneWire.write(0x48);            // 复制暂存器到E2PROM
-  delay(40);                      // E2PROM写周期（≤40ms，规格书要求）
-  Serial.println("M601配置完成：1次/秒测量，高重复性");
+  oneWire.write(0x48);            // 保存配置到E2PROM
+  delay(30);
+#if DEBUG_MODE
+  Serial.println("M601配置完成");
+#endif
 }
 
-// M601温度读取（含设备搜索、CRC校验、10kΩ时序适配）
 float readM601Temp(void) {
-  // 首次调用时搜索M601设备
   if (!m601_init_flag) {
     bool found = false;
-    // 多轮搜索（最多5次，提高成功率）
-    for (int retry = 0; retry < 5; retry++) {
+    for (int retry = 0; retry < M601_SEARCH_RETRY; retry++) {
       oneWire.reset();                
-      delayMicroseconds(1500);       // 10kΩ适配：复位后等待1.5ms
+      delayMicroseconds(1000);
       if (oneWire.search(m601_rom_addr)) { 
         found = true;
         break;
       }
       oneWire.reset_search();         
-      delay(300);                     
+      delay(200);                   
     }
 
-    // 设备未找到处理
     if (!found) {
-      Serial.println("M601：5次搜索未找到（检查10kΩ上拉/接线/供电）");
+#if DEBUG_MODE
+      Serial.println("M601未找到（检查上拉/接线）");
+#endif
       return -999.0;
     }
 
-    // 打印ROM地址（用于调试）
-    Serial.print("M601 ROM地址：");
-    for (int i = 0; i < 8; i++) {
-      Serial.print(m601_rom_addr[i], HEX);
-      Serial.print(" ");
-    }
-    Serial.println();
-
-    // ROM地址校验（符合M601规格书）
     if (m601_rom_addr[0] != 0x28) {
-      Serial.println("M601：设备类型错误（首字节应为0x28）");
+#if DEBUG_MODE
+      Serial.println("M601设备类型错误");
+#endif
       return -999.0;
     }
-    // 最后两字节为00时跳过CRC（规格书11.2备注）
-    if (m601_rom_addr[6] == 0x00 && m601_rom_addr[7] == 0x00) {
-      Serial.println("M601：ROM尾字节为00，跳过CRC校验");
-    } else if (OneWire::crc8(m601_rom_addr, 7) != m601_rom_addr[7]) {
-      Serial.println("M601：ROM CRC校验失败（地址读取错误）");
+    if (!(m601_rom_addr[6] == 0x00 && m601_rom_addr[7] == 0x00) && 
+        OneWire::crc8(m601_rom_addr, 7) != m601_rom_addr[7]) {
+#if DEBUG_MODE
+      Serial.println("M601 ROM CRC失败");
+#endif
       return -999.0;
     }
 
-    // 配置M601并标记初始化完成
     configM601(m601_rom_addr);
     m601_init_flag = true;
   }
 
-  // 读取温度数据
-  byte scratchpad[9];  // 暂存器缓存（8字节数据+1字节CRC）
-  int16_t temp_raw;    // 原始温度值（16位）
+  byte scratchpad[9];
+  int16_t temp_raw;
 
-  // 1. 启动温度转换
   oneWire.reset();
   oneWire.select(m601_rom_addr);
-  oneWire.write(0x44, 1);  // 启动测温（带寄生电源模式）
+  oneWire.write(0x44, 1);  // 启动测温
 
-  // 2. 等待测温完成（10kΩ适配超时25ms）
   unsigned long start_time = millis();
   while (true) {
-    if (oneWire.read_bit() == 1) break;  // 测温完成（DQ引脚变高）
-    if (millis() - start_time > 25) {
-      Serial.println("M601：测温超时（检查总线通信）");
+    if (oneWire.read_bit() == 1) break;
+    if (millis() - start_time > 20) {
+#if DEBUG_MODE
+      Serial.println("M601测温超时");
+#endif
       return -999.0;
     }
-    delayMicroseconds(120);  // 10kΩ适配：读取间隔
+    delayMicroseconds(50);
   }
 
-  // 3. 读取暂存器数据
   oneWire.reset();
   oneWire.select(m601_rom_addr);
-  oneWire.write(0xBE);        // 读暂存器指令
-  delayMicroseconds(200);     // 10kΩ适配：数据准备等待
+  oneWire.write(0xBE);        
+  delayMicroseconds(100);
   for (int i = 0; i < 9; i++) {
     scratchpad[i] = oneWire.read();
   }
 
-  // 4. 暂存器CRC校验
   if (OneWire::crc8(scratchpad, 8) != scratchpad[8]) {
-    Serial.println("M601：温度数据CRC校验失败");
+#if DEBUG_MODE
+    Serial.println("M601数据CRC失败");
+#endif
     return -999.0;
   }
 
-  // 5. 温度数据转换（规格书9.1公式）
   temp_raw = (scratchpad[1] << 8) | scratchpad[0];
   float temperature;
-  if (temp_raw & 0x8000) {  // 负温度处理
+  if (temp_raw & 0x8000) {
     temp_raw = ~temp_raw + 1;
     temperature = 40 - (temp_raw * 0.00390625);
-  } else {  // 正温度处理
+  } else {
     temperature = 40 + temp_raw * 0.00390625;
   }
 
+  pinMode(ONE_WIRE_BUS, INPUT);
   return temperature;
 }
 
-// -------------------------- 4. BLE MAC地址设置函数 --------------------------
-// 设置自定义MAC地址（需在Bluefruit.begin()后调用）
+// -------------------------- 4. BLE配置 --------------------------
 bool setCustomMacAddress(uint8_t* custom_addr) {
   ble_gap_addr_t gap_addr;
-  gap_addr.addr_type = 1;  // 地址类型：1=静态随机地址（符合蓝牙规范）
-  memcpy(gap_addr.addr, custom_addr, 6);  // 复制自定义地址到结构体
+  gap_addr.addr_type = BLE_GAP_ADDR_TYPE_RANDOM_STATIC;
+  memcpy(gap_addr.addr, custom_addr, 6);
 
-  // 调用单参数setAddr函数（适配Seeeduino nRF52 1.1.10库）
   if (Bluefruit.setAddr(&gap_addr)) {
-    Serial.print("自定义MAC地址（大端序）：");
-    for (int i = 5; i >= 0; i--) {  // 小端转大端显示（常规MAC格式）
-      Serial.printf("%02X", gap_addr.addr[i]);
-      if (i > 0) Serial.print(":");
+#if DEBUG_MODE
+    Serial.print("自定义MAC：");
+    for (int i = 5; i >= 0; i--) {
+      Serial.printf("%02X%s", gap_addr.addr[i], i>0?":":"");
     }
     Serial.println();
+#endif
     return true;
   } else {
-    Serial.println("自定义MAC地址设置失败！");
+#if DEBUG_MODE
+    Serial.println("MAC设置失败");
+#endif
     return false;
   }
 }
 
-// 打印默认出厂MAC地址（用于对比调试）
-void printDefaultMacAddress() {
-  ble_gap_addr_t default_addr;
-  if (sd_ble_gap_addr_get(&default_addr) == NRF_SUCCESS) {
-    Serial.print("默认出厂MAC地址：");
-    for (int i = 5; i >= 0; i--) {
-      Serial.printf("%02X", default_addr.addr[i]);
-      if (i > 0) Serial.print(":");
-    }
-    Serial.println();
-  } else {
-    Serial.println("无法获取默认MAC地址");
-  }
-}
-
-// -------------------------- 5. BLE信标广播配置 --------------------------
 void startBeaconAdv() {
-  // 配置信标参数（UUID、Major、Minor、RSSI）
+  // 配置信标参数（移除setRssi，通过构造函数初始化）
+  beacon = BLEBeacon(beaconUuid, 0x0000, 0x0000, -54);  // 此处传入RSSI
   beacon.setManufacturer(MANUFACTURER_ID);
-  
-  // 配置广播参数
-  Bluefruit.Advertising.setBeacon(beacon);  // 广播包加载信标数据
-  Bluefruit.ScanResponse.addName();         // 扫描响应包添加设备名称
-  Bluefruit.Advertising.restartOnDisconnect(true);  // 断开后重新广播
-  Bluefruit.Advertising.setInterval(160, 160);      // 广播间隔：100ms（160*0.625ms）
-  Bluefruit.Advertising.setFastTimeout(30);         // 快速广播超时：30秒
-  Bluefruit.Advertising.start(0);                   // 无限广播（0=不超时）
 
-  Serial.println("BLE信标已开始广播（用nRF Connect扫描）");
+  // 广播配置（用addTxPower替代setTxPower）
+  Bluefruit.Advertising.setType(BLE_GAP_ADV_TYPE_NONCONNECTABLE_SCANNABLE_UNDIRECTED);
+  Bluefruit.Advertising.setBeacon(beacon);
+  Bluefruit.Advertising.setInterval(BLE_ADV_INTERVAL, BLE_ADV_INTERVAL);
+  Bluefruit.Advertising.addTxPower();  // 添加发射功率信息
+  Bluefruit.Advertising.restartOnDisconnect(false);
+  Bluefruit.Advertising.start(0);
+
+#if DEBUG_MODE
+  Serial.printf("BLE启动（间隔：%dms）\n", BLE_ADV_INTERVAL * 625 / 1000);
+#endif
 }
 
-// -------------------------- 6. 初始化与主循环 --------------------------
-void setup() {
-  // 1. 初始化单总线引脚（禁用内部上拉，依赖外部10kΩ）
-  pinMode(ONE_WIRE_BUS, INPUT);
-  Serial.begin(115200);
-  while (!Serial) delay(10);  // 等待串口连接
-  Serial.println("=== M601+BLE信标（自定义MAC） ===");
-
-  // 2. 验证M601外部10kΩ上拉（空闲电平应为高）
-  int dq_idle_level = digitalRead(ONE_WIRE_BUS);
-  Serial.printf("M601 DQ引脚空闲电平：%d（1=正常，0=上拉失效）\n", dq_idle_level);
-  if (dq_idle_level != 1) {
-    Serial.println("错误：外部10kΩ上拉未生效（检查DQ-VDD接线）");
-    while (1);  // 上拉错误时卡死，提示用户检查
+// -------------------------- 5. 低功耗优化 --------------------------
+void optimizeGpio() {
+  // 仅优化未使用的GPIO，跳过必要引脚
+  for (uint8_t pin = 0; pin < 32; pin++) {
+    if (pin != ONE_WIRE_BUS && pin != TX_PIN && pin != RX_PIN) {
+      pinMode(pin, INPUT);
+    }
   }
+#if DEBUG_MODE == 0
+  // 关闭串口引脚（低功耗模式）
+  pinMode(TX_PIN, INPUT);
+  pinMode(RX_PIN, INPUT);
+#endif
+}
 
-  // 3. 初始化BLE模块
+// -------------------------- 6. 主程序 --------------------------
+void setup() {
+#if DEBUG_MODE
+  Serial.begin(115200);
+  while (!Serial) delay(10);
+  Serial.println("=== M601+BLE信标 ===");
+#endif
+
+  // 检查M601上拉
+  pinMode(ONE_WIRE_BUS, INPUT);
+  int dq_idle = digitalRead(ONE_WIRE_BUS);
+#if DEBUG_MODE
+  Serial.printf("M601 DQ电平：%d（1=正常）\n", dq_idle);
+#endif
+  if (dq_idle != 1) while (1);  // 上拉错误
+
+  // 优化GPIO
+  optimizeGpio();
+
+  // 初始化BLE
   if (!Bluefruit.begin()) {
-    Serial.println("BLE模块初始化失败！");
+#if DEBUG_MODE
+    Serial.println("BLE初始化失败");
+#endif
     while (1);
   }
-  Bluefruit.setName("M601-Beacon");  // 设备名称（扫描时可见）
-  Bluefruit.setTxPower(0);           // 发射功率：0dBm（平衡功耗与距离）
+  Bluefruit.setName("M601-Beacon");
+  setCustomMacAddress(custom_mac_addr);
 
-  // 4. 设置自定义MAC地址
-  if (!setCustomMacAddress(custom_mac_addr)) {
-    printDefaultMacAddress();  // 失败时打印默认地址
-  }
-
-  // 5. 初始化信标参数（不使用begin()方法，直接通过构造函数初始化）
-  beacon = BLEBeacon(beaconUuid, 0x0000, 0x0000, -54);
+  // 启动广播
   startBeaconAdv();
 
-  Serial.println("初始化完成，等待M601温度采集...");
+#if DEBUG_MODE
+  Serial.println("初始化完成");
+#endif
+  last_wake_ms = millis();
 }
 
 void loop() {
-  // 1. 读取M601温度
+  // 1秒唤醒一次
+  if (millis() - last_wake_ms < 1000) {
+    delay(10);
+    return;
+  }
+  last_wake_ms = millis();
+
+  // 读取温度
   float temperature = readM601Temp();
-  if (temperature != -999.0) {  // 温度读取成功
-    Serial.printf("M601温度：%.2f ℃\n", temperature);
+  if (temperature == -999.0) return;
 
-    // 2. 将温度嵌入BLE信标（Major=整数部分，Minor=小数部分*100）
-    uint16_t temp_int = (uint16_t)temperature;                  // 整数部分（如25.67→25）
-    uint16_t temp_dec = (uint16_t)((temperature - temp_int)*100); // 小数部分（如25.67→67）
-    beacon.setMajorMinor(temp_int, temp_dec);  // 更新信标Major/Minor
+  // 温度变化时更新广播
+  if (fabs(temperature - last_temp) > TEMP_UPDATE_THRESH) {
+#if DEBUG_MODE
+    Serial.printf("温度：%.2f ℃\n", temperature);
+#endif
+    last_temp = temperature;
 
-    // 3. 重启广播（更新Major/Minor后需重启广播生效）
+    uint16_t temp_int = (uint16_t)temperature;
+    uint16_t temp_dec = (uint16_t)fabs((temperature - temp_int) * 100);
+    beacon.setMajorMinor(temp_int, temp_dec);
+
+    // 更新广播
     Bluefruit.Advertising.stop();
     Bluefruit.Advertising.setBeacon(beacon);
     Bluefruit.Advertising.start(0);
   }
-
-  delay(1000);  // 与M601测量周期同步（1次/秒）
 }
